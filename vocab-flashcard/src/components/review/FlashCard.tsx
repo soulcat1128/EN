@@ -2,7 +2,7 @@
  * 翻轉卡片元件
  */
 
-import { useState, useEffect } from 'react'
+// import { useState, useEffect } from 'react'
 
 interface FlashCardProps {
   word: string
@@ -21,15 +21,15 @@ export function FlashCard({
   isFlipped,
   onFlip,
 }: FlashCardProps) {
-  const [isAnimating, setIsAnimating] = useState(false)
+  // const [isAnimating, setIsAnimating] = useState(false)
 
-  useEffect(() => {
-    if (isFlipped) {
-      setIsAnimating(true)
-      const timer = setTimeout(() => setIsAnimating(false), 600)
-      return () => clearTimeout(timer)
-    }
-  }, [isFlipped])
+  // useEffect(() => {
+  //   if (isFlipped) {
+  //     setIsAnimating(true)
+  //     const timer = setTimeout(() => setIsAnimating(false), 600)
+  //     return () => clearTimeout(timer)
+  //   }
+  // }, [isFlipped])
 
   return (
     <div

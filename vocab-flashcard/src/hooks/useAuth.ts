@@ -38,7 +38,7 @@ export function useAuth() {
     })
 
     // 監聽認證狀態變化
-    const { data: { subscription } } = onAuthStateChange((event, session) => {
+    const { data: { subscription } } = onAuthStateChange((_event, session) => {
       setState(prev => ({
         ...prev,
         user: session?.user ?? null,

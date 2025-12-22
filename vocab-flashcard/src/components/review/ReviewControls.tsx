@@ -2,7 +2,7 @@
  * 複習評分控制元件
  */
 
-import { Button } from '@/components/ui'
+// import { Button } from '@/components/ui'
 import { formatInterval } from '@/lib/sm2/algorithm'
 import type { SM2Quality } from '@/types'
 
