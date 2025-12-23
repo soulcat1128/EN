@@ -241,13 +241,29 @@ export async function cacheUserWords(deckId: string, userId: string, userWords: 
 
 /**
  * 更新單一用戶單字快取（複習後）
+ * 使用 user_id + word_id 作為唯一識別，而非 id
  */
 export async function updateCachedUserWord(userWord: UserWord): Promise<void> {
   try {
     const db = await initDB()
     const tx = db.transaction('userWords', 'readwrite')
     const store = tx.objectStore('userWords')
-    store.put(userWord)
+    const index = store.index('user_word')
+
+    // 先嘗試找到現有記錄
+    const existingRequest = index.get([userWord.user_id, userWord.word_id])
+
+    existingRequest.onsuccess = () => {
+      const existing = existingRequest.result as UserWord | undefined
+      if (existing) {
+        // 更新現有記錄，保留原本的 id
+        store.put({ ...userWord, id: existing.id })
+      } else {
+        // 新記錄，生成臨時 id
+        const tempId = `temp-${userWord.user_id}-${userWord.word_id}`
+        store.put({ ...userWord, id: tempId })
+      }
+    }
 
     await new Promise<void>((resolve, reject) => {
       tx.oncomplete = () => resolve()

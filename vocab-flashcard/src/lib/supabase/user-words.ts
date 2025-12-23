@@ -67,24 +67,38 @@ export async function getDueWords(
 
   // 嘗試從快取取得資料
   let words: Word[] | null = await getCachedWords(deckId)
-  let userWords: UserWord[] | null = await getCachedUserWords(deckId, user.id)
+  let cachedUserWords: UserWord[] | null = await getCachedUserWords(deckId, user.id)
 
-  // 如果有快取，先用快取資料，背景同步
-  if (words && userWords !== null) {
-    // 背景更新快取（不阻塞）
-    Promise.all([
-      fetchAndCacheWords(deckId),
-      fetchAndCacheUserWords(deckId, user.id),
-    ]).catch(() => {})
-  } else {
-    // 沒有快取，同步取得
-    const [fetchedWords, fetchedUserWords] = await Promise.all([
-      fetchAndCacheWords(deckId),
-      fetchAndCacheUserWords(deckId, user.id),
-    ])
-    words = fetchedWords
-    userWords = fetchedUserWords
+  // 永遠從伺服器取得最新的 userWords（確保學習進度正確）
+  // 因為樂觀更新可能與伺服器資料不同步
+  const [fetchedWords, fetchedUserWords] = await Promise.all([
+    words ? Promise.resolve(words) : fetchAndCacheWords(deckId),
+    fetchAndCacheUserWords(deckId, user.id),
+  ])
+
+  words = fetchedWords
+  // 合併：伺服器資料為主，但保留本地更新的 due_at（如果更晚的話）
+  const userWordsMap = new Map<string, UserWord>()
+  for (const uw of fetchedUserWords) {
+    userWordsMap.set(uw.word_id, uw)
   }
+  // 如果本地快取有更晚的 due_at，使用本地的（樂觀更新）
+  if (cachedUserWords) {
+    for (const cachedUw of cachedUserWords) {
+      const serverUw = userWordsMap.get(cachedUw.word_id)
+      if (serverUw) {
+        const cachedDue = new Date(cachedUw.due_at)
+        const serverDue = new Date(serverUw.due_at)
+        if (cachedDue > serverDue) {
+          userWordsMap.set(cachedUw.word_id, { ...serverUw, due_at: cachedUw.due_at })
+        }
+      } else if (cachedUw.id.startsWith('temp-')) {
+        // 本地新增的樂觀更新（伺服器還沒有）
+        userWordsMap.set(cachedUw.word_id, cachedUw)
+      }
+    }
+  }
+  const userWords = Array.from(userWordsMap.values())
 
   // 建立單字查詢 Map
   const wordsMap = new Map<string, Word>()
@@ -92,11 +106,9 @@ export async function getDueWords(
     wordsMap.set(w.id, w)
   }
 
-  // 建立已學習單字 ID Set 和 UserWord Map
-  const userWordsMap = new Map<string, UserWord>()
+  // 建立已學習單字 ID Set（userWordsMap 已在上面建立）
   const learnedWordIds = new Set<string>()
   for (const uw of userWords) {
-    userWordsMap.set(uw.word_id, uw)
     learnedWordIds.add(uw.word_id)
   }
 

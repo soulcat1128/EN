@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm run deploy:*)"
+      "Bash(npm run deploy:*)",
+      "Bash(dir:*)",
+      "Bash(npm run build:*)"
     ]
   }
 }

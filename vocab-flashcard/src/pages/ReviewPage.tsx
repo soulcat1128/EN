@@ -2,7 +2,7 @@
  * 複習頁面 - 核心功能
  */
 
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useReviewWords, useSubmitReview } from '@/hooks/useReview'
 import { useDeck } from '@/hooks/useDecks'
@@ -40,6 +40,9 @@ export function ReviewPage() {
   const submitReviewMutation = useSubmitReview()
   const { processReview, previewIntervals } = useSM2()
 
+  // 防止快速連續點擊
+  const isProcessingRef = useRef(false)
+
   // 初始化複習佇列
   useEffect(() => {
     if (words) {
@@ -64,24 +67,26 @@ export function ReviewPage() {
   // 提交評分
   const handleRate = useCallback(
     async (quality: SM2Quality) => {
-      if (!currentWord || !deckId) return
+      // 防止快速連續點擊
+      if (isProcessingRef.current || !currentWord || !deckId) return
+      isProcessingRef.current = true
 
-      const previousState = currentWord.sm2State
-      const result = processReview(previousState, quality)
-      const wasCorrect = quality >= 3
-
-      // 更新統計
-      setStats(prev => ({
-        ...prev,
-        correct: prev.correct + (wasCorrect ? 1 : 0),
-        incorrect: prev.incorrect + (wasCorrect ? 0 : 1),
-        newLearned:
-          prev.newLearned + (currentWord.isNew && wasCorrect ? 1 : 0),
-      }))
-
-      // 提交到資料庫
       try {
-        await submitReviewMutation.mutateAsync({
+        const previousState = currentWord.sm2State
+        const result = processReview(previousState, quality)
+        const wasCorrect = quality >= 3
+
+        // 更新統計
+        setStats(prev => ({
+          ...prev,
+          correct: prev.correct + (wasCorrect ? 1 : 0),
+          incorrect: prev.incorrect + (wasCorrect ? 0 : 1),
+          newLearned:
+            prev.newLearned + (currentWord.isNew && wasCorrect ? 1 : 0),
+        }))
+
+        // 提交到資料庫（不等待，背景執行）
+        submitReviewMutation.mutate({
           wordId: currentWord.wordId,
           deckId: deckId,
           quality,
@@ -89,35 +94,47 @@ export function ReviewPage() {
           nextDueDate: result.nextDueDate,
           previousState,
         })
-      } catch (error) {
-        console.error('Submit review error:', error)
-      }
 
-      // 如果錯誤，將卡片加回佇列末端重新學習
-      if (!wasCorrect) {
-        setReviewQueue(prev => [
-          ...prev,
-          {
-            ...currentWord,
-            sm2State: result.nextState,
-            isNew: false,
-          },
-        ])
-        setStats(prev => ({ ...prev, total: prev.total + 1 }))
-      }
+        // 翻回正面
+        setIsFlipped(false)
 
-      // 下一張卡片
-      setIsFlipped(false)
-      if (currentIndex < reviewQueue.length - 1) {
-        setCurrentIndex(prev => prev + 1)
-      } else if (!wasCorrect) {
-        // 還有重新加入的卡片
-        setCurrentIndex(prev => prev + 1)
-      } else {
-        setPhase('summary')
+        // 使用函數式更新確保狀態同步
+        setReviewQueue(prev => {
+          const isLastCard = currentIndex >= prev.length - 1
+
+          if (!wasCorrect) {
+            // 錯誤：將卡片加回佇列末端
+            const newQueue = [
+              ...prev,
+              {
+                ...currentWord,
+                sm2State: result.nextState,
+                isNew: false,
+              },
+            ]
+            // 更新 total
+            setStats(s => ({ ...s, total: s.total + 1 }))
+            // 移到下一張
+            setCurrentIndex(i => i + 1)
+            return newQueue
+          } else if (isLastCard) {
+            // 正確且是最後一張：結束
+            setPhase('summary')
+            return prev
+          } else {
+            // 正確但還有下一張
+            setCurrentIndex(i => i + 1)
+            return prev
+          }
+        })
+      } finally {
+        // 短暫延遲後解鎖，防止過快連續點擊
+        setTimeout(() => {
+          isProcessingRef.current = false
+        }, 150)
       }
     },
-    [currentWord, currentIndex, reviewQueue.length, processReview, submitReviewMutation, deckId]
+    [currentWord, currentIndex, processReview, submitReviewMutation, deckId]
   )
 
   // 鍵盤快捷鍵
@@ -196,7 +213,7 @@ export function ReviewPage() {
     )
   }
 
-  const progress = ((currentIndex + 1) / reviewQueue.length) * 100
+  const progress = Math.min(100, ((currentIndex + 1) / reviewQueue.length) * 100)
   const intervals = currentWord ? previewIntervals(currentWord.sm2State) : null
 
   return (
