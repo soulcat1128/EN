@@ -1,9 +1,11 @@
 /**
  * 單字庫列表元件
+ * 優化：使用批量查詢取得所有 deck 統計，避免 N+1 問題
  */
 
+import { useMemo } from 'react'
 import { DeckCard } from './DeckCard'
-import { useDeckStats } from '@/hooks/useDecks'
+import { useAllDeckStats } from '@/hooks/useDecks'
 import type { Deck } from '@/types'
 
 interface DeckListProps {
@@ -14,6 +16,10 @@ interface DeckListProps {
 }
 
 export function DeckList({ decks, onStartReview, onEdit, onDelete }: DeckListProps) {
+  // 批量取得所有 deck 的統計
+  const deckIds = useMemo(() => decks.map(d => d.id), [decks])
+  const { data: allStats } = useAllDeckStats(deckIds)
+
   if (decks.length === 0) {
     return (
       <div className="text-center py-12">
@@ -31,39 +37,15 @@ export function DeckList({ decks, onStartReview, onEdit, onDelete }: DeckListPro
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
       {decks.map(deck => (
-        <DeckCardWithStats
+        <DeckCard
           key={deck.id}
           deck={deck}
+          stats={allStats?.[deck.id]}
           onStartReview={() => onStartReview(deck.id)}
           onEdit={onEdit ? () => onEdit(deck.id) : undefined}
           onDelete={onDelete ? () => onDelete(deck.id) : undefined}
         />
       ))}
     </div>
-  )
-}
-
-// 帶統計的卡片（分離以優化 re-render）
-function DeckCardWithStats({
-  deck,
-  onStartReview,
-  onEdit,
-  onDelete,
-}: {
-  deck: Deck
-  onStartReview: () => void
-  onEdit?: () => void
-  onDelete?: () => void
-}) {
-  const { data: stats } = useDeckStats(deck.id)
-
-  return (
-    <DeckCard
-      deck={deck}
-      stats={stats}
-      onStartReview={onStartReview}
-      onEdit={onEdit}
-      onDelete={onDelete}
-    />
   )
 }

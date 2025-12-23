@@ -10,7 +10,9 @@ import {
   createDeck,
   updateDeck,
   deleteDeck,
+  getAllDeckStatsWithCache,
 } from '@/lib/supabase/decks'
+import type { DeckStats } from '@/types'
 
 // Query Keys
 export const deckKeys = {
@@ -50,6 +52,27 @@ export function useDeckStats(deckId: string) {
     queryKey: deckKeys.stats(deckId),
     queryFn: () => getDeckStats(deckId),
     enabled: !!deckId,
+    staleTime: 60 * 1000, // 1 分鐘
+  })
+}
+
+/**
+ * 批量取得所有 deck 統計（優化版本）
+ * 一次查詢取得所有統計，避免 N+1 問題
+ */
+export function useAllDeckStats(deckIds: string[]) {
+  return useQuery({
+    queryKey: ['decks', 'allStats', deckIds.sort().join(',')],
+    queryFn: async () => {
+      const { stats } = await getAllDeckStatsWithCache(deckIds)
+      // 將 Map 轉換為物件以便序列化
+      const result: Record<string, DeckStats> = {}
+      stats.forEach((value, key) => {
+        result[key] = value
+      })
+      return result
+    },
+    enabled: deckIds.length > 0,
     staleTime: 60 * 1000, // 1 分鐘
   })
 }

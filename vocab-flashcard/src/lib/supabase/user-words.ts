@@ -3,11 +3,57 @@
  */
 
 import { supabase } from './client'
-import type { ReviewWord, SM2CardState } from '@/types'
+import type { ReviewWord, SM2CardState, Word, UserWord } from '@/types'
 import { createInitialState } from '@/lib/sm2/algorithm'
+import {
+  getCachedWords,
+  cacheWords,
+  getCachedUserWords,
+  cacheUserWords,
+  updateCachedUserWord,
+  invalidateDeckStats,
+} from '@/lib/cache/indexedDB'
 
 /**
- * 取得待複習單字
+ * 從伺服器取得單字並快取
+ */
+async function fetchAndCacheWords(deckId: string): Promise<Word[]> {
+  const { data, error } = await supabase
+    .from('words')
+    .select('*')
+    .eq('deck_id', deckId)
+    .order('created_at', { ascending: true })
+
+  if (error) throw error
+  const words = data || []
+
+  // 背景快取
+  cacheWords(deckId, words).catch(() => {})
+
+  return words
+}
+
+/**
+ * 從伺服器取得用戶單字並快取
+ */
+async function fetchAndCacheUserWords(deckId: string, userId: string): Promise<UserWord[]> {
+  const { data, error } = await supabase
+    .from('user_words')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('deck_id', deckId)
+
+  if (error) throw error
+  const userWords = data || []
+
+  // 背景快取
+  cacheUserWords(deckId, userId, userWords).catch(() => {})
+
+  return userWords
+}
+
+/**
+ * 取得待複習單字（優化版本：使用快取）
  * 包含：到期的單字 + 新單字（如果需要）
  */
 export async function getDueWords(
@@ -17,55 +63,60 @@ export async function getDueWords(
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) throw new Error('Not authenticated')
 
-  const now = new Date().toISOString()
+  const now = new Date()
 
-  // 1. 取得已有學習紀錄且到期的單字
-  const { data: dueUserWords, error: dueError } = await supabase
-    .from('user_words')
-    .select(`
-      *,
-      words (*)
-    `)
-    .eq('user_id', user.id)
-    .eq('deck_id', deckId)
-    .lte('due_at', now)
-    .order('due_at', { ascending: true })
+  // 嘗試從快取取得資料
+  let words: Word[] | null = await getCachedWords(deckId)
+  let userWords: UserWord[] | null = await getCachedUserWords(deckId, user.id)
 
-  if (dueError) throw dueError
+  // 如果有快取，先用快取資料，背景同步
+  if (words && userWords !== null) {
+    // 背景更新快取（不阻塞）
+    Promise.all([
+      fetchAndCacheWords(deckId),
+      fetchAndCacheUserWords(deckId, user.id),
+    ]).catch(() => {})
+  } else {
+    // 沒有快取，同步取得
+    const [fetchedWords, fetchedUserWords] = await Promise.all([
+      fetchAndCacheWords(deckId),
+      fetchAndCacheUserWords(deckId, user.id),
+    ])
+    words = fetchedWords
+    userWords = fetchedUserWords
+  }
 
-  // 2. 取得已有學習紀錄的單字 IDs
-  const { data: allUserWords } = await supabase
-    .from('user_words')
-    .select('word_id')
-    .eq('user_id', user.id)
-    .eq('deck_id', deckId)
+  // 建立單字查詢 Map
+  const wordsMap = new Map<string, Word>()
+  for (const w of words) {
+    wordsMap.set(w.id, w)
+  }
 
-  const learnedWordIds = new Set((allUserWords || []).map(uw => uw.word_id))
+  // 建立已學習單字 ID Set 和 UserWord Map
+  const userWordsMap = new Map<string, UserWord>()
+  const learnedWordIds = new Set<string>()
+  for (const uw of userWords) {
+    userWordsMap.set(uw.word_id, uw)
+    learnedWordIds.add(uw.word_id)
+  }
 
-  // 3. 取得新單字（尚未有學習紀錄的）
-  const { data: allWords } = await supabase
-    .from('words')
-    .select('*')
-    .eq('deck_id', deckId)
-    .order('created_at', { ascending: true })
-
-  const newWords = (allWords || [])
-    .filter(w => !learnedWordIds.has(w.id))
-    .slice(0, newWordsLimit)
-
-  // 4. 組合結果
   const result: ReviewWord[] = []
 
-  // 加入到期的單字
-  for (const uw of (dueUserWords || [])) {
-    if (uw.words) {
+  // 1. 加入到期的單字（已有學習紀錄且 due_at <= now）
+  const dueUserWords = userWords
+    .filter(uw => new Date(uw.due_at) <= now)
+    .sort((a, b) => new Date(a.due_at).getTime() - new Date(b.due_at).getTime())
+
+  for (const uw of dueUserWords) {
+    const word = wordsMap.get(uw.word_id)
+    if (word) {
       result.push({
         id: uw.id,
         wordId: uw.word_id,
-        word: uw.words.word,
-        meaningZh: uw.words.meaning_zh,
-        exampleSentence: uw.words.example_sentence || undefined,
-        pronunciation: uw.words.pronunciation || undefined,
+        word: word.word,
+        meaningZh: word.meaning_zh,
+        exampleSentence: word.example_sentence || undefined,
+        pronunciation: word.pronunciation || undefined,
         sm2State: {
           repetitions: uw.repetitions,
           easeFactor: Number(uw.ease_factor),
@@ -76,10 +127,14 @@ export async function getDueWords(
     }
   }
 
-  // 加入新單字
+  // 2. 加入新單字（尚未有學習紀錄的）
+  const newWords = words
+    .filter(w => !learnedWordIds.has(w.id))
+    .slice(0, newWordsLimit)
+
   for (const word of newWords) {
     result.push({
-      id: '', // 新單字還沒有 user_word 記錄
+      id: '',
       wordId: word.id,
       word: word.word,
       meaningZh: word.meaning_zh,
@@ -94,7 +149,7 @@ export async function getDueWords(
 }
 
 /**
- * 提交複習結果
+ * 提交複習結果（優化版本：並行執行 + 樂觀更新）
  */
 export async function submitReview(params: {
   wordId: string
@@ -104,19 +159,90 @@ export async function submitReview(params: {
   nextDueDate: Date
   previousState?: SM2CardState
 }): Promise<void> {
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) throw new Error('Not authenticated')
-
   const { wordId, deckId, quality, newState, nextDueDate, previousState } = params
   const wasCorrect = quality >= 3
   const now = new Date().toISOString()
 
-  // 1. 更新或建立 user_words 記錄
-  const { error: upsertError } = await supabase
+  // 取得用戶（這個通常已經快取在 Supabase client）
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) throw new Error('Not authenticated')
+
+  // 立即更新本地快取（樂觀更新）
+  const optimisticUserWord: UserWord = {
+    id: '', // 會被 upsert 覆蓋
+    user_id: user.id,
+    word_id: wordId,
+    deck_id: deckId,
+    repetitions: newState.repetitions,
+    ease_factor: newState.easeFactor,
+    interval: newState.interval,
+    due_at: nextDueDate.toISOString(),
+    last_review_at: now,
+    total_reviews: 0,
+    correct_reviews: 0,
+    created_at: now,
+    updated_at: now,
+  }
+  updateCachedUserWord(optimisticUserWord).catch(() => {})
+  invalidateDeckStats(deckId).catch(() => {})
+
+  // 並行執行所有資料庫操作（不阻塞 UI）
+  Promise.all([
+    // 1. Upsert user_words（含統計更新）
+    supabase.rpc('upsert_user_word_with_stats', {
+      p_user_id: user.id,
+      p_word_id: wordId,
+      p_deck_id: deckId,
+      p_repetitions: newState.repetitions,
+      p_ease_factor: newState.easeFactor,
+      p_interval: newState.interval,
+      p_due_at: nextDueDate.toISOString(),
+      p_was_correct: wasCorrect,
+    }).then(({ error }) => {
+      // 如果 RPC 不存在，fallback 到原本的方式
+      if (error?.code === '42883') {
+        return submitReviewFallback(user.id, params, wasCorrect, now)
+      }
+      if (error) console.error('upsert error:', error)
+    }),
+
+    // 2. 記錄複習歷史
+    supabase.from('review_logs').insert({
+      user_id: user.id,
+      word_id: wordId,
+      deck_id: deckId,
+      quality,
+      ease_factor_before: previousState?.easeFactor || null,
+      ease_factor_after: newState.easeFactor,
+      interval_before: previousState?.interval || null,
+      interval_after: newState.interval,
+      reviewed_at: now,
+    }),
+  ]).catch(err => console.error('submitReview background error:', err))
+}
+
+/**
+ * Fallback：如果沒有 RPC，用原本的方式（但並行執行）
+ */
+async function submitReviewFallback(
+  userId: string,
+  params: {
+    wordId: string
+    deckId: string
+    newState: SM2CardState
+    nextDueDate: Date
+  },
+  wasCorrect: boolean,
+  now: string
+): Promise<void> {
+  const { wordId, deckId, newState, nextDueDate } = params
+
+  // 先 upsert
+  await supabase
     .from('user_words')
     .upsert(
       {
-        user_id: user.id,
+        user_id: userId,
         word_id: wordId,
         deck_id: deckId,
         repetitions: newState.repetitions,
@@ -125,44 +251,19 @@ export async function submitReview(params: {
         due_at: nextDueDate.toISOString(),
         last_review_at: now,
       },
-      {
-        onConflict: 'user_id,word_id',
-      }
+      { onConflict: 'user_id,word_id' }
     )
 
-  if (upsertError) throw upsertError
-
-  // 2. 更新統計（使用單獨的更新）
-  const { data: existingRecord } = await supabase
-    .from('user_words')
-    .select('total_reviews, correct_reviews')
-    .eq('user_id', user.id)
-    .eq('word_id', wordId)
-    .single()
-
-  if (existingRecord) {
-    await supabase
-      .from('user_words')
-      .update({
-        total_reviews: (existingRecord.total_reviews || 0) + 1,
-        correct_reviews: (existingRecord.correct_reviews || 0) + (wasCorrect ? 1 : 0),
-      })
-      .eq('user_id', user.id)
-      .eq('word_id', wordId)
+  // 更新統計（使用 SQL 增量更新，避免 read-then-write）
+  try {
+    await supabase.rpc('increment_review_stats', {
+      p_user_id: userId,
+      p_word_id: wordId,
+      p_was_correct: wasCorrect,
+    })
+  } catch {
+    // 如果 RPC 不存在，忽略統計更新（不影響核心功能）
   }
-
-  // 3. 記錄複習歷史
-  await supabase.from('review_logs').insert({
-    user_id: user.id,
-    word_id: wordId,
-    deck_id: deckId,
-    quality,
-    ease_factor_before: previousState?.easeFactor || null,
-    ease_factor_after: newState.easeFactor,
-    interval_before: previousState?.interval || null,
-    interval_after: newState.interval,
-    reviewed_at: now,
-  })
 }
 
 /**
