@@ -267,69 +267,86 @@ async function submitReviewFallback(
 }
 
 /**
- * 取得學習統計
+ * 取得學習統計（優化版本：並行查詢）
  */
 export async function getStats() {
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) throw new Error('Not authenticated')
 
-  // 取得所有用戶單字
-  const { data: allUserWords } = await supabase
-    .from('user_words')
-    .select('*')
-    .eq('user_id', user.id)
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  const todayStr = today.toISOString()
 
-  const userWords = allUserWords || []
+  const thirtyDaysAgo = new Date()
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
+
+  // 並行執行所有查詢
+  const [
+    userWordsResult,
+    todayReviewedResult,
+    todayNewLearnedResult,
+    recentLogsResult,
+    streakLogsResult,
+  ] = await Promise.all([
+    // 1. 取得所有用戶單字（含 due_at 用於預測）
+    supabase
+      .from('user_words')
+      .select('repetitions, interval, due_at')
+      .eq('user_id', user.id),
+
+    // 2. 今日複習數
+    supabase
+      .from('review_logs')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', user.id)
+      .gte('reviewed_at', todayStr),
+
+    // 3. 今日新學的單字
+    supabase
+      .from('review_logs')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', user.id)
+      .gte('reviewed_at', todayStr)
+      .or('interval_before.is.null,interval_before.eq.0'),
+
+    // 4. 過去 30 天的 logs
+    supabase
+      .from('review_logs')
+      .select('reviewed_at, quality')
+      .eq('user_id', user.id)
+      .gte('reviewed_at', thirtyDaysAgo.toISOString())
+      .order('reviewed_at', { ascending: true }),
+
+    // 5. 用於計算 streak 的 logs
+    supabase
+      .from('review_logs')
+      .select('reviewed_at')
+      .eq('user_id', user.id)
+      .order('reviewed_at', { ascending: false }),
+  ])
+
+  const userWords = userWordsResult.data || []
 
   // 計算基本統計
   const totalWords = userWords.length
   const learnedWords = userWords.filter(uw => uw.repetitions > 0).length
   const masteredWords = userWords.filter(uw => uw.interval > 21).length
 
-  // 今日統計
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  const todayStr = today.toISOString()
+  // 計算 streak（本地計算，不再查詢）
+  const streak = calculateStreakFromLogs(streakLogsResult.data || [])
 
-  const { count: todayReviewed } = await supabase
-    .from('review_logs')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', user.id)
-    .gte('reviewed_at', todayStr)
+  // 計算每日統計
+  const dailyStats = groupByDate(recentLogsResult.data || [])
 
-  // 今日新學的單字（interval_before 為 null 或 0）
-  const { count: todayNewLearned } = await supabase
-    .from('review_logs')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', user.id)
-    .gte('reviewed_at', todayStr)
-    .or('interval_before.is.null,interval_before.eq.0')
-
-  // 計算連續學習天數
-  const streak = await calculateStreak(user.id)
-
-  // 過去 30 天統計
-  const thirtyDaysAgo = new Date()
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
-
-  const { data: recentLogs } = await supabase
-    .from('review_logs')
-    .select('reviewed_at, quality')
-    .eq('user_id', user.id)
-    .gte('reviewed_at', thirtyDaysAgo.toISOString())
-    .order('reviewed_at', { ascending: true })
-
-  const dailyStats = groupByDate(recentLogs || [])
-
-  // 未來 7 天預測
-  const forecast = await getForecast(user.id)
+  // 計算未來 7 天預測（本地計算，不再查詢）
+  const forecast = calculateForecastFromUserWords(userWords)
 
   return {
     totalWords,
     learnedWords,
     masteredWords,
-    todayReviewed: todayReviewed || 0,
-    todayNewLearned: todayNewLearned || 0,
+    todayReviewed: todayReviewedResult.count || 0,
+    todayNewLearned: todayNewLearnedResult.count || 0,
     currentStreak: streak,
     dailyStats,
     forecast,
@@ -337,14 +354,9 @@ export async function getStats() {
 }
 
 /**
- * 計算連續學習天數
+ * 從 logs 計算連續學習天數（本地計算）
  */
-async function calculateStreak(userId: string): Promise<number> {
-  const { data: logs } = await supabase
-    .from('review_logs')
-    .select('reviewed_at')
-    .eq('user_id', userId)
-    .order('reviewed_at', { ascending: false })
+function calculateStreakFromLogs(logs: { reviewed_at: string }[]): number {
 
   if (!logs || logs.length === 0) return 0
 
@@ -406,11 +418,12 @@ function groupByDate(logs: { reviewed_at: string; quality: number }[]) {
 }
 
 /**
- * 取得未來 7 天待複習預測
+ * 從 user_words 計算未來 7 天待複習預測（本地計算）
  */
-async function getForecast(userId: string) {
+function calculateForecastFromUserWords(userWords: { due_at: string }[]) {
   const forecast = []
   const now = new Date()
+  const dayNames = ['日', '一', '二', '三', '四', '五', '六']
 
   for (let i = 0; i < 7; i++) {
     const date = new Date(now)
@@ -420,18 +433,16 @@ async function getForecast(userId: string) {
     const startDate = new Date(date)
     startDate.setHours(0, 0, 0, 0)
 
-    const { count } = await supabase
-      .from('user_words')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', userId)
-      .gte('due_at', startDate.toISOString())
-      .lte('due_at', date.toISOString())
+    // 本地計算該日到期的單字數
+    const count = userWords.filter(uw => {
+      const dueAt = new Date(uw.due_at)
+      return dueAt >= startDate && dueAt <= date
+    }).length
 
-    const dayNames = ['日', '一', '二', '三', '四', '五', '六']
     forecast.push({
       date: date.toISOString().split('T')[0],
       label: i === 0 ? '今天' : i === 1 ? '明天' : `週${dayNames[date.getDay()]}`,
-      count: count || 0,
+      count,
     })
   }
 
